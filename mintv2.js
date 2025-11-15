@@ -2,6 +2,10 @@ require('dotenv').config();
 const axios = require('axios');
 const { ethers } = require('ethers');
 const { randomUUID } = require('crypto');
+const http = require('http');
+const https = require('https');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { HttpProxyAgent } = require('http-proxy-agent');
 
 const {
   PRIVATE_KEY,
@@ -13,8 +17,27 @@ const {
   RECIPIENT,
   RELAYER,
   TOKEN,
-  MINT_COUNT = 10
+  MINT_COUNT =500
 } = process.env;
+
+const PROXY_URL = process.env.PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY;
+let httpProxyAgent;
+let httpsProxyAgent;
+
+if (PROXY_URL) {
+  try {
+    httpProxyAgent = new HttpProxyAgent(PROXY_URL);
+    httpsProxyAgent = new HttpsProxyAgent(PROXY_URL);
+    axios.defaults.proxy = false;
+    axios.defaults.httpAgent = httpProxyAgent;
+    axios.defaults.httpsAgent = httpsProxyAgent;
+    http.globalAgent = httpProxyAgent;
+    https.globalAgent = httpsProxyAgent;
+    console.log(`[proxy] Enabled via ${PROXY_URL}`);
+  } catch (err) {
+    console.warn("[proxy] Failed to enable proxy:", err?.message || err);
+  }
+}
 
 const DEFAULT_RPC_CANDIDATES = [
   'https://bsc-dataseed.binance.org',
@@ -33,6 +56,19 @@ const SCTG_IN_URL = process.env.SCTG_IN_URL || "https://api.sctg.xyz/in.php";
 const SCTG_RES_URL = process.env.SCTG_RES_URL || "https://api.sctg.xyz/res.php";
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* ------------------------------------------
+   WATCHER — trigger claim realtime
+-------------------------------------------*/
+const WATCH_ADDR = [
+  "0x39dcdd14a0c40e19cd8c892fd00e9e7963cd49d3".toLowerCase(),
+  "0xafcD15f17D042eE3dB94CdF6530A97bf32A74E02".toLowerCase()
+];
+const WATCH_WINDOW = Number(process.env.WATCH_WINDOW || 15);
+let lastBlock = 0;
+let watcherBusy = false;
+let jwtToken;
+let approvedOnce = false;
 
 function buildRpcList() {
   const list = [];
@@ -201,6 +237,142 @@ async function buildPermit(amount, relayer) {
   return { authorization: msg, signature: sig };
 }
 
+async function fetchPaymentRequirement(jwt) {
+  console.log("dY\"? Fetching REAL payment requirement...");
+  try {
+    await axios.post(
+      `${API_BASE}/faucet/drip`,
+      { recipientAddress: RECIPIENT },
+      { headers: { Authorization: `Bearer ${jwt}` } }
+    );
+  } catch (err) {
+    if (err.response?.status === 402) {
+      const req = err.response.data.paymentRequirements;
+      console.log("dY'  Payment requirement FOUND:", req.amount);
+      return req;
+    }
+    throw err;
+  }
+  throw new Error("Cannot obtain payment requirement: faucet drip did not return 402.");
+}
+
+async function blastPermits(pay, jwt) {
+  console.log(`dY  Building ${MINT_COUNT} turbo permits...`);
+  const permits = [];
+  for (let i = 0; i < MINT_COUNT; i++) {
+    permits.push(await buildPermit(pay.amount, pay.relayerContract));
+    console.log(` o" Permit ${i + 1}`);
+  }
+
+  console.log("\ndYs? BLASTING PERMITS (ultra-parallel)...");
+
+  await Promise.all(
+    permits.map(async (p, i) => {
+      try {
+        const r = await axios.post(
+          `${API_BASE}/faucet/drip`,
+          {
+            recipientAddress: RECIPIENT,
+            paymentPayload: { token: TOKEN, payload: p },
+            paymentRequirements: {
+              network: pay.network,
+              relayerContract: pay.relayerContract
+            }
+          },
+          { headers: { Authorization: `Bearer ${jwt}` } }
+        );
+
+        console.log(`dYYc Mint #${i + 1} SUCCESS  +' ${r.data.nftTransaction}`);
+      } catch (e) {
+        console.log(`dYY  Mint #${i + 1} FAILED  +'`, e.response?.data || e.message);
+      }
+    })
+  );
+}
+
+async function performLogin() {
+  const ts = await solveTurnstile();
+  const { lid, challenge } = await getChallenge(ts);
+  const signed = await wallet.signMessage(challenge.message);
+  const verify = await verifyChallenge(lid, signed, ts);
+  const jwt = verify.jwt || verify.token;
+  console.log("dYYc Logged in!");
+  return jwt;
+}
+
+async function runClaimFlow(attempt = 0) {
+  if (!jwtToken) {
+    jwtToken = await performLogin();
+  }
+
+  if (!approvedOnce) {
+    await approveUnlimited();
+    approvedOnce = true;
+  }
+
+  try {
+    const pay = await fetchPaymentRequirement(jwtToken);
+    await blastPermits(pay, jwtToken);
+  } catch (err) {
+    if (err.response?.status === 401 && attempt < 1) {
+      console.log("dY?? JWT expired, re-authenticating...");
+      jwtToken = null;
+      return runClaimFlow(attempt + 1);
+    }
+    throw err;
+  }
+}
+
+async function watchDistribution() {
+  console.log(` Watching distribution… (window ${WATCH_WINDOW}s)`);
+
+  while (true) {
+    try {
+      const block = await provider.getBlockNumber();
+
+      if (block > lastBlock) {
+        const data = await provider.getBlockWithTransactions(block);
+        lastBlock = block;
+
+        if (!data) {
+          continue;
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        const isFreshBlock = Math.abs(now - (data.timestamp || now)) <= WATCH_WINDOW;
+
+        for (let tx of data.transactions) {
+          const from = tx.from?.toLowerCase();
+          if (
+            from &&
+            isFreshBlock &&
+            WATCH_ADDR.includes(from) &&
+            !watcherBusy
+          ) {
+            console.log(" DISTRIBUTION TX DETECTED from:", tx.from);
+
+            watcherBusy = true;
+            try {
+              await runClaimFlow();
+            } catch (err) {
+              console.log("⚠ Claim flow error:", err?.message || err);
+            }
+            watcherBusy = false;
+
+            console.log(" Restarting watcher…");
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      console.log("⚠ Watcher error:", err.message);
+      await delay(4000);
+    }
+
+    await delay(2000);
+  }
+}
+
 /* -------------------------------------------------------------
    MAIN
 -------------------------------------------------------------*/
@@ -213,71 +385,10 @@ async function buildPermit(amount, relayer) {
     CHAIN_ID = chainId || CHAIN_ID || 56;
     console.log(`[RPC] Active endpoint ready (chainId ${CHAIN_ID}).`);
 
-    console.log("🚀 TURBO v41 — AUTO APPROVE + PREPAY + PERMIT BLAST");
+    console.log("Watcher armed - waiting for dev distribution...");
+    jwtToken = await performLogin();
+    await watchDistribution();
 
-    /* LOGIN ---------------------------------------------------*/
-    const ts = await solveTurnstile();
-    const { lid, challenge } = await getChallenge(ts);
-    const signed = await wallet.signMessage(challenge.message);
-    const verify = await verifyChallenge(lid, signed, ts);
-    const jwt = verify.jwt || verify.token;
-    console.log("🟩 Logged in!");
-  
-    /* APPROVE --------------------------------------------------*/
-    await approveUnlimited();
-  
-    /* TRIGGER REAL 402 -----------------------------------------*/
-    console.log("🔍 Fetching REAL payment requirement...");
-    let pay;
-    try {
-      await axios.post(`${API_BASE}/faucet/drip`,
-        { recipientAddress: RECIPIENT },
-        { headers: { Authorization: `Bearer ${jwt}` } }
-      );
-    } catch (err) {
-      if (err.response?.status === 402) {
-        pay = err.response.data.paymentRequirements;
-        console.log("💰 Payment requirement FOUND:", pay.amount);
-      } else {
-        throw new Error("❌ Cannot obtain payment requirement");
-      }
-    }
-  
-    /* BUILD PERMITS -------------------------------------------*/
-    console.log(`🧱 Building ${MINT_COUNT} turbo permits...`);
-    const permits = [];
-    for (let i = 0; i < MINT_COUNT; i++) {
-      permits.push(await buildPermit(pay.amount, pay.relayerContract));
-      console.log(`✔ Permit ${i + 1}`);
-    }
-  
-    /* FIRE ALL PERMITS (TURBO PARALLEL) ------------------------*/
-    console.log("\n🚀 BLASTING PERMITS (ultra-parallel)...");
-  
-    await Promise.all(
-      permits.map(async (p, i) => {
-        try {
-          const r = await axios.post(
-            `${API_BASE}/faucet/drip`,
-            {
-              recipientAddress: RECIPIENT,
-              paymentPayload: { token: TOKEN, payload: p },
-              paymentRequirements: {
-                network: pay.network,
-                relayerContract: pay.relayerContract
-              }
-            },
-            { headers: { Authorization: `Bearer ${jwt}` } }
-          );
-  
-          console.log(`🟩 Mint #${i + 1} SUCCESS → ${r.data.nftTransaction}`);
-        } catch (e) {
-          console.log(`🟥 Mint #${i + 1} FAILED →`, e.response?.data || e.message);
-        }
-      })
-    );
-  
-    console.log("\n🎉 DONE — TURBO COMPLETE!");
   } catch (error) {
     console.error("❌ Fatal error:", error?.message || error);
     process.exitCode = 1;
